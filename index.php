@@ -62,8 +62,11 @@ function bx_call($method, $params = []) {
 
     if ($res === false) {
         $err = error_get_last();
+        log_msg("HTTP ERROR: " . json_encode($err));
         throw new RuntimeException("HTTP REQUEST FAILED: " . ($err['message'] ?? 'unknown error'));
     }
+
+    log_msg("Response from $method: " . substr($res, 0, 500));
 
     $json = json_decode($res, true);
     if (!is_array($json)) {
@@ -71,52 +74,111 @@ function bx_call($method, $params = []) {
     }
 
     if (!empty($json['error'])) {
+        log_msg("B24 API ERROR: " . json_encode($json));
         throw new RuntimeException("B24 REST ERROR: {$json['error']} - {$json['error_description']}");
     }
 
-    return $json['result'];
+    return $json['result'] ?? $json;
 }
 
 /**
  * Находит все активные бизнес-процессы по сделке.
- * DOCUMENT_ID у процессов: ['crm', 'CCrmDocumentDeal', 'DEAL_<ID>']
  */
 function findWorkflowsByDeal($dealId) {
-    $targetDocId = 'DEAL_' . (int)$dealId;
+    log_msg("=== SEARCHING WORKFLOWS FOR DEAL #$dealId ===");
 
-    log_msg("Looking for workflows for DOCUMENT_ID = $targetDocId");
+    try {
+        // Вариант 1: Через bizproc.workflow.instances
+        $instances = bx_call('bizproc.workflow.instances', [
+            'select' => ['ID', 'MODULE_ID', 'ENTITY', 'DOCUMENT_ID', 'TEMPLATE_ID', 'STARTED', 'WORKFLOW_STATUS'],
+            'filter' => [
+                '=MODULE_ID' => 'crm',
+                '=ENTITY'    => 'CCrmDocumentDeal',
+            ],
+        ]);
 
-    // Берём все активные CRM-процессы по сделкам
-    $instances = bx_call('bizproc.workflow.instances', [
-        'select' => ['ID', 'MODULE_ID', 'ENTITY', 'DOCUMENT_ID', 'TEMPLATE_ID', 'STARTED'],
-        'filter' => [
-            '=MODULE_ID' => 'crm',
-            '=ENTITY'    => 'CCrmDocumentDeal',
-        ],
-    ]);
+        log_msg('Total workflows found: ' . count($instances));
+        log_msg('Raw workflows data: ' . json_encode($instances, JSON_UNESCAPED_UNICODE));
 
-    log_msg('Raw workflows: ' . json_encode($instances, JSON_UNESCAPED_UNICODE));
+        $result = [];
+        $targetDocId = 'DEAL_' . (int)$dealId;
 
-    $result = [];
-
-    foreach ($instances as $wf) {
-        $docId = $wf['DOCUMENT_ID'] ?? '';
-        
-        // DOCUMENT_ID может быть массивом: ['crm', 'CCrmDocumentDeal', 'DEAL_123']
-        if (is_array($docId)) {
-            $docId = end($docId); // Берём последний элемент массива
+        foreach ($instances as $wf) {
+            $docId = $wf['DOCUMENT_ID'] ?? '';
+            
+            log_msg("Processing WF ID={$wf['ID']}, raw DOCUMENT_ID: " . json_encode($docId));
+            
+            // DOCUMENT_ID может быть массивом: ['crm', 'CCrmDocumentDeal', 'DEAL_123']
+            if (is_array($docId)) {
+                $docIdStr = end($docId); // Берём последний элемент
+                log_msg("  -> Converted to: $docIdStr");
+            } else {
+                $docIdStr = $docId;
+            }
+            
+            if ($docIdStr === $targetDocId) {
+                $result[] = $wf;
+                log_msg("  ✓ MATCHED! WF ID={$wf['ID']}, Status={$wf['WORKFLOW_STATUS']}");
+            }
         }
-        
-        log_msg("Checking workflow ID={$wf['ID']}, DOCUMENT_ID=$docId");
-        
-        if ($docId === $targetDocId) {
-            $result[] = $wf;
-            log_msg("✓ Matched workflow ID={$wf['ID']}");
+
+        log_msg("Total matched workflows: " . count($result));
+        return $result;
+
+    } catch (Exception $e) {
+        log_msg("ERROR in findWorkflowsByDeal: " . $e->getMessage());
+        return [];
+    }
+}
+
+/**
+ * Останавливает бизнес-процесс (несколько методов)
+ */
+function terminateWorkflow($wfId, $wfData = []) {
+    log_msg("=== TERMINATING WORKFLOW ID=$wfId ===");
+    
+    // Метод 1: bizproc.workflow.terminate
+    try {
+        log_msg("Trying bizproc.workflow.terminate...");
+        $result = bx_call('bizproc.workflow.terminate', [
+            'ID' => $wfId,
+            'STATUS' => 'Stopped by automation'
+        ]);
+        log_msg("SUCCESS: terminate result = " . json_encode($result));
+        return true;
+    } catch (Exception $e) {
+        log_msg("FAILED terminate: " . $e->getMessage());
+    }
+
+    // Метод 2: bizproc.workflow.kill
+    try {
+        log_msg("Trying bizproc.workflow.kill...");
+        $result = bx_call('bizproc.workflow.kill', [
+            'ID' => $wfId
+        ]);
+        log_msg("SUCCESS: kill result = " . json_encode($result));
+        return true;
+    } catch (Exception $e) {
+        log_msg("FAILED kill: " . $e->getMessage());
+    }
+
+    // Метод 3: Через полный массив DOCUMENT_ID
+    if (!empty($wfData['DOCUMENT_ID'])) {
+        try {
+            log_msg("Trying with full DOCUMENT_ID array...");
+            $result = bx_call('bizproc.workflow.terminate', [
+                'DOCUMENT_ID' => $wfData['DOCUMENT_ID'],
+                'ID' => $wfId
+            ]);
+            log_msg("SUCCESS: terminate with DOCUMENT_ID = " . json_encode($result));
+            return true;
+        } catch (Exception $e) {
+            log_msg("FAILED terminate with DOCUMENT_ID: " . $e->getMessage());
         }
     }
 
-    log_msg("Matched workflows count = " . count($result));
-    return $result;
+    log_msg("ERROR: All methods failed for WF ID=$wfId");
+    return false;
 }
 
 
@@ -127,6 +189,7 @@ function findWorkflowsByDeal($dealId) {
 try {
     // Читаем тело запроса от исходящего вебхука Bitrix24
     $raw = file_get_contents('php://input');
+    log_msg("==================== NEW REQUEST ====================");
     log_msg("RAW: ".$raw);
 
     $payload = json_decode($raw, true);
@@ -173,10 +236,14 @@ try {
     $workflows = findWorkflowsByDeal($dealId);
 
     if (!empty($workflows)) {
+        log_msg("Found " . count($workflows) . " workflows to terminate");
         foreach ($workflows as $wf) {
-            $wfId = $wf['ID'];
-            log_msg("Terminate WF ID=$wfId (TEMPLATE_ID={$wf['TEMPLATE_ID']}, STARTED={$wf['STARTED']})");
-            bx_call('bizproc.workflow.terminate', ['ID' => $wfId]);
+            $success = terminateWorkflow($wf['ID'], $wf);
+            if ($success) {
+                log_msg("✓ Successfully terminated WF ID={$wf['ID']}");
+            } else {
+                log_msg("✗ Failed to terminate WF ID={$wf['ID']}");
+            }
         }
     } else {
         log_msg("No active workflows for this deal");
@@ -187,8 +254,11 @@ try {
     //----------------------------------------------------------------------
 
     $binding = 'D_'.$dealId;
+    log_msg("=== CLOSING TASKS FOR BINDING: $binding ===");
 
     $next = 0;
+    $totalClosed = 0;
+    
     do {
         $res = bx_call('tasks.task.list', [
             'select' => ['ID','TITLE','STATUS','UF_CRM_TASK'],
@@ -202,17 +272,25 @@ try {
         $tasks = $res['tasks'] ?? [];
         $next  = $res['next'] ?? -1;
 
+        log_msg("Batch: found " . count($tasks) . " tasks");
+
         foreach ($tasks as $t) {
             $tId   = $t['id'];
             $title = $t['title'] ?? '';
-            log_msg("Close TASK ID=$tId ($title)");
-            bx_call('tasks.task.update', [
-                'taskId' => $tId,
-                'fields' => ['STATUS' => 5],
-            ]);
+            try {
+                log_msg("Closing TASK ID=$tId ($title)");
+                bx_call('tasks.task.update', [
+                    'taskId' => $tId,
+                    'fields' => ['STATUS' => 5],
+                ]);
+                $totalClosed++;
+            } catch (Exception $e) {
+                log_msg("ERROR closing task $tId: " . $e->getMessage());
+            }
         }
     } while ($next != -1);
 
+    log_msg("Total tasks closed: $totalClosed");
     log_msg("CLEANUP DONE for deal $dealId");
 
     http_response_code(200);
@@ -220,10 +298,13 @@ try {
         'success' => true,
         'dealId'  => $dealId,
         'stage'   => $stage,
+        'workflowsTerminated' => count($workflows),
+        'tasksClosed' => $totalClosed,
     ]);
 
 } catch (Throwable $e) {
-    log_msg("ERROR: ".$e->getMessage());
+    log_msg("FATAL ERROR: ".$e->getMessage());
+    log_msg("Stack trace: " . $e->getTraceAsString());
     http_response_code(500);
     echo json_encode([
         'success' => false,
