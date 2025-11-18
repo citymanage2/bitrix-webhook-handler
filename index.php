@@ -1,99 +1,81 @@
 <?php
 /**
- * Bitrix24 Webhook Handler (Render PHP)
- * -------------------------------------
- * Сценарий:
- *  - Render вызывает этот PHP-файл по событию onCrmDealUpdate
- *  - PHP получает ID сделки
- *  - Проверяет:
- *        CATEGORY_ID == 2
- *        STAGE_ID in [C2:WON, C2:APOLOGY, C2:LOSE]
- *  - Если условия совпадают:
- *        1) Завершает все активные бизнес-процессы сделки
- *        2) Закрывает все связанные задачи UF_CRM_TASK = D_<ID>
- *
- * Требуется:
- *  - Вставить НИЖЕ URL входящего вебхука Bitrix24
- *    (Настройки → Приложения → Вебхуки → Входящий вебхук)
+ * Bitrix24 Webhook Handler (Render PHP, без curl)
  */
 
-////////////////////////////////////////////////////////////////////////////////
+///////////////////////////////////////////////////////////////////////////////
 // 1. НАСТРОЙКА WEBHOOK API BITRIX24
-////////////////////////////////////////////////////////////////////////////////
+///////////////////////////////////////////////////////////////////////////////
 
 $BX_INCOMING = 'https://ВАШПОРТАЛ.bitrix24.ru/rest/ХХ/ТОКЕН/';   // ← ЗАМЕНИТЬ!!!
 
-// целевая категория (воронка)
 $TARGET_CATEGORY = 2;
+$TARGET_STAGES   = ['C2:WON', 'C2:APOLOGY', 'C2:LOSE'];
 
-// стадии, на которых запускаем зачистку
-$TARGET_STAGES = ['C2:WON', 'C2:APOLOGY', 'C2:LOSE'];
-
-// включить логирование в файл /tmp/render-b24.log
 $ENABLE_LOG = true;
-$LOG_FILE = '/tmp/render-b24.log';
+$LOG_FILE   = '/tmp/render-b24.log';
 
 
-////////////////////////////////////////////////////////////////////////////////
+///////////////////////////////////////////////////////////////////////////////
 // 2. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
-////////////////////////////////////////////////////////////////////////////////
+///////////////////////////////////////////////////////////////////////////////
 
 function log_msg($msg) {
     global $ENABLE_LOG, $LOG_FILE;
     if (!$ENABLE_LOG) return;
-    file_put_contents($LOG_FILE, '['.date('Y-m-d H:i:s').'] '.$msg.PHP_EOL, FILE_APPEND);
+    @file_put_contents($LOG_FILE, '['.date('Y-m-d H:i:s').'] '.$msg.PHP_EOL, FILE_APPEND);
 }
 
+/**
+ * Вызов REST-метода Bitrix24 через file_get_contents
+ */
 function bx_call($method, $params = []) {
     global $BX_INCOMING;
 
-    $url = $BX_INCOMING . $method . '.json';
-    $ch  = curl_init($url);
+    $url  = $BX_INCOMING . $method . '.json';
+    $data = http_build_query($params);
 
-    curl_setopt_array($ch, [
-        CURLOPT_POST           => true,
-        CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_POSTFIELDS     => http_build_query($params),
-        CURLOPT_CONNECTTIMEOUT => 10,
-        CURLOPT_TIMEOUT        => 20,
-    ]);
+    $opts = [
+        'http' => [
+            'method'  => 'POST',
+            'header'  => "Content-Type: application/x-www-form-urlencoded\r\n"
+                       . "Content-Length: " . strlen($data) . "\r\n",
+            'content' => $data,
+            'timeout' => 20,
+        ]
+    ];
 
-    $res = curl_exec($ch);
+    $context = stream_context_create($opts);
+    $res = @file_get_contents($url, false, $context);
 
     if ($res === false) {
-        $err = curl_error($ch);
-        curl_close($ch);
-        throw new RuntimeException("CURL ERROR: $err");
+        $err = error_get_last();
+        throw new RuntimeException("HTTP REQUEST FAILED: " . ($err['message'] ?? 'unknown error'));
     }
 
-    curl_close($ch);
-
-    $data = json_decode($res, true);
-    if (!is_array($data)) {
-        throw new RuntimeException("INVALID JSON: ".substr($res,0,200));
+    $json = json_decode($res, true);
+    if (!is_array($json)) {
+        throw new RuntimeException("INVALID JSON: ".substr($res, 0, 200));
     }
 
-    if (!empty($data['error'])) {
-        throw new RuntimeException("B24 REST ERROR: {$data['error']} - {$data['error_description']}");
+    if (!empty($json['error'])) {
+        throw new RuntimeException("B24 REST ERROR: {$json['error']} - {$json['error_description']}");
     }
 
-    return $data['result'];
+    return $json['result'];
 }
 
 
-////////////////////////////////////////////////////////////////////////////////
-// 3. ОСНОВНОЙ ОБРАБОТЧИК ВХОДЯЩЕГО СОБЫТИЯ
-////////////////////////////////////////////////////////////////////////////////
+///////////////////////////////////////////////////////////////////////////////
+// 3. ОСНОВНОЙ ОБРАБОТЧИК
+///////////////////////////////////////////////////////////////////////////////
 
 try {
-    // читаем payload от Bitrix24 (исходящий вебхук)
     $raw = file_get_contents('php://input');
-    log_msg("RAW: " . $raw);
+    log_msg("RAW: ".$raw);
 
     $payload = json_decode($raw, true);
-
-    // ищем ID сделки
-    $dealId = 0;
+    $dealId  = 0;
 
     if (isset($payload['data']['FIELDS']['ID'])) {
         $dealId = (int)$payload['data']['FIELDS']['ID'];
@@ -102,67 +84,50 @@ try {
     }
 
     if ($dealId <= 0) {
-        log_msg("NO DEAL ID FOUND — EXIT");
+        log_msg("NO DEAL ID — EXIT");
         http_response_code(204);
         exit;
     }
 
     log_msg("Processing DEAL #$dealId");
 
-    ////////////////////////////////////////////////////////////////////////////
-    // 4. ПОЛУЧАЕМ ПОЛЯ СДЕЛКИ
-    ////////////////////////////////////////////////////////////////////////////
-
+    // --- 4. Получаем сделку ---
     $deal = bx_call('crm.deal.get', ['id' => $dealId]);
 
-    $stage     = $deal['STAGE_ID']     ?? '';
-    $category  = (int)($deal['CATEGORY_ID'] ?? -1);
+    $stage    = $deal['STAGE_ID'] ?? '';
+    $category = (int)($deal['CATEGORY_ID'] ?? -1);
 
     log_msg("Deal: STAGE=$stage, CATEGORY=$category");
-
-    ////////////////////////////////////////////////////////////////////////////
-    // 5. ПРОВЕРКА УСЛОВИЙ ДЛЯ ЗАПУСКА «ЗАЧИСТКИ»
-    ////////////////////////////////////////////////////////////////////////////
 
     global $TARGET_CATEGORY, $TARGET_STAGES;
 
     if ($category !== $TARGET_CATEGORY || !in_array($stage, $TARGET_STAGES, true)) {
-        log_msg("Deal is NOT in target category/stage — SKIP");
+        log_msg("Not our category/stage — SKIP");
         http_response_code(204);
         exit;
     }
 
-    log_msg("Conditions OK — running CLEANUP");
+    log_msg("Conditions OK — CLEANUP start");
 
-
-    ////////////////////////////////////////////////////////////////////////////
-    // 6. ОСТАНАВЛИВАЕМ ВСЕ АКТИВНЫЕ БИЗНЕС-ПРОЦЕССЫ
-    ////////////////////////////////////////////////////////////////////////////
-
+    // --- 5. Останавливаем все активные БП ---
     $docId = ['crm', 'CCrmDocumentDeal', 'DEAL_'.$dealId];
 
     $instances = bx_call('bizproc.workflow.instances', [
-        'select' => ['ID', 'MODIFIED', 'STARTED', 'TEMPLATE_ID'],
+        'select' => ['ID','MODIFIED','STARTED','TEMPLATE_ID'],
         'filter' => ['=DOCUMENT_ID' => $docId],
     ]);
 
     if (!empty($instances)) {
         foreach ($instances as $wf) {
             $wfId = $wf['ID'];
-            log_msg("Terminating workflow ID=$wfId");
-            bx_call('bizproc.workflow.terminate', [
-                'ID' => $wfId,
-            ]);
+            log_msg("Terminate WF ID=$wfId");
+            bx_call('bizproc.workflow.terminate', ['ID' => $wfId]);
         }
     } else {
-        log_msg("NO active workflows");
+        log_msg("No active workflows");
     }
 
-
-    ////////////////////////////////////////////////////////////////////////////
-    // 7. ЗАКРЫВАЕМ ВСЕ ЗАДАЧИ, ПРИВЯЗАННЫЕ К СДЕЛКЕ
-    ////////////////////////////////////////////////////////////////////////////
-
+    // --- 6. Закрываем задачи, привязанные к сделке ---
     $binding = 'D_'.$dealId;
 
     $next = 0;
@@ -181,31 +146,25 @@ try {
 
         foreach ($tasks as $t) {
             $tId = $t['id'];
-            log_msg("Closing task ID=$tId");
+            log_msg("Close TASK ID=$tId");
             bx_call('tasks.task.update', [
                 'taskId' => $tId,
                 'fields' => ['STATUS' => 5],
             ]);
         }
-
     } while ($next != -1);
 
+    log_msg("CLEANUP DONE for deal $dealId");
 
-    ////////////////////////////////////////////////////////////////////////////
-    // 8. ОКОНЧАНИЕ РАБОТЫ
-    ////////////////////////////////////////////////////////////////////////////
-
-    log_msg("CLEANUP COMPLETE for deal $dealId");
-
+    http_response_code(200);
     echo json_encode([
         'success' => true,
         'dealId'  => $dealId,
         'stage'   => $stage,
     ]);
-    http_response_code(200);
 
 } catch (Throwable $e) {
-    log_msg("ERROR: " . $e->getMessage());
+    log_msg("ERROR: ".$e->getMessage());
     http_response_code(500);
     echo json_encode([
         'success' => false,
