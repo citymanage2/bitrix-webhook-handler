@@ -7,7 +7,7 @@
 // 1. НАСТРОЙКА WEBHOOK API BITRIX24
 ///////////////////////////////////////////////////////////////////////////////
 
-$BX_INCOMING = 'https://ВАШПОРТАЛ.bitrix24.ru/rest/ХХ/ТОКЕН/';   // ← ЗАМЕНИТЬ!!!
+$BX_INCOMING = 'https://b24-p60ult.bitrix24.ru/rest/42/2enlvyaqd1s0w238/';   // ← ЗАМЕНИТЬ!!!
 
 $TARGET_CATEGORY = 2;
 $TARGET_STAGES   = ['C2:WON', 'C2:APOLOGY', 'C2:LOSE'];
