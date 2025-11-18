@@ -79,7 +79,7 @@ function bx_call($method, $params = []) {
 
 /**
  * Находит все активные бизнес-процессы по сделке.
- * DOCUMENT_ID у процессов: DEAL_<ID>
+ * DOCUMENT_ID у процессов: ['crm', 'CCrmDocumentDeal', 'DEAL_<ID>']
  */
 function findWorkflowsByDeal($dealId) {
     $targetDocId = 'DEAL_' . (int)$dealId;
@@ -101,8 +101,17 @@ function findWorkflowsByDeal($dealId) {
 
     foreach ($instances as $wf) {
         $docId = $wf['DOCUMENT_ID'] ?? '';
+        
+        // DOCUMENT_ID может быть массивом: ['crm', 'CCrmDocumentDeal', 'DEAL_123']
+        if (is_array($docId)) {
+            $docId = end($docId); // Берём последний элемент массива
+        }
+        
+        log_msg("Checking workflow ID={$wf['ID']}, DOCUMENT_ID=$docId");
+        
         if ($docId === $targetDocId) {
             $result[] = $wf;
+            log_msg("✓ Matched workflow ID={$wf['ID']}");
         }
     }
 
