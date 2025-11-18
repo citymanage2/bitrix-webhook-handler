@@ -1,17 +1,25 @@
 <?php
 /**
  * Bitrix24 Webhook Handler (Render PHP, без curl)
+ *  - При onCrmDealUpdate проверяет сделку:
+ *      CATEGORY_ID == 2
+ *      STAGE_ID in [C2:WON, C2:APOLOGY, C2:LOSE]
+ *  - Если да:
+ *      1) Находит и ОСТАНАВЛИВАЕТ все активные БП по сделке
+ *      2) Потом закрывает все задачи UF_CRM_TASK = D_<ID>
  */
 
 ///////////////////////////////////////////////////////////////////////////////
 // 1. НАСТРОЙКА WEBHOOK API BITRIX24
 ///////////////////////////////////////////////////////////////////////////////
 
-$BX_INCOMING = 'https://b24-p60ult.bitrix24.ru/rest/42/2enlvyaqd1s0w238/';   // ← ЗАМЕНИТЬ!!!
+$BX_INCOMING = 'https://ВАШПОРТАЛ.bitrix24.ru/rest/ХХ/ТОКЕН/';   // ← ЗАМЕНИТЬ!!!
 
+// Целевая воронка и стадии
 $TARGET_CATEGORY = 2;
 $TARGET_STAGES   = ['C2:WON', 'C2:APOLOGY', 'C2:LOSE'];
 
+// Логирование
 $ENABLE_LOG = true;
 $LOG_FILE   = '/tmp/render-b24.log';
 
@@ -65,6 +73,52 @@ function bx_call($method, $params = []) {
     return $json['result'];
 }
 
+/**
+ * Находит все активные БП по сделке и возвращает массив workflow'ов
+ */
+function findWorkflowsByDeal($dealId) {
+    $docIdStr = "crm|CCrmDocumentDeal|DEAL_{$dealId}";
+    log_msg("Looking for workflows with DOCUMENT_ID = $docIdStr");
+
+    // 1) Пробуем напрямую по DOCUMENT_ID
+    $instances = bx_call('bizproc.workflow.instances', [
+        'select' => ['ID', 'DOCUMENT_ID', 'MODIFIED', 'TEMPLATE_ID', 'STARTED'],
+        'filter' => ['=DOCUMENT_ID' => $docIdStr],
+    ]);
+
+    $result = [];
+
+    if (!empty($instances)) {
+        foreach ($instances as $wf) {
+            if (($wf['DOCUMENT_ID'] ?? '') === $docIdStr) {
+                $result[] = $wf;
+            }
+        }
+    }
+
+    // 2) Подстраховка: если вдруг фильтр не сработал — берём все CRM-процессы и
+    //    вручную отфильтровываем по DOCUMENT_ID
+    if (empty($result)) {
+        log_msg("No workflows by =DOCUMENT_ID, fallback by MODULE_ID/ENTITY");
+        $instances2 = bx_call('bizproc.workflow.instances', [
+            'select' => ['ID', 'DOCUMENT_ID', 'MODIFIED', 'TEMPLATE_ID', 'STARTED'],
+            'filter' => [
+                '=MODULE_ID' => 'crm',
+                '=ENTITY'    => 'CCrmDocumentDeal',
+            ],
+        ]);
+
+        foreach ($instances2 as $wf) {
+            if (($wf['DOCUMENT_ID'] ?? '') === $docIdStr) {
+                $result[] = $wf;
+            }
+        }
+    }
+
+    log_msg("Found workflows count = " . count($result));
+    return $result;
+}
+
 
 ///////////////////////////////////////////////////////////////////////////////
 // 3. ОСНОВНОЙ ОБРАБОТЧИК
@@ -91,7 +145,7 @@ try {
 
     log_msg("Processing DEAL #$dealId");
 
-    // --- 4. Получаем сделку ---
+    // --- 4. Получаем данные сделки ---
     $deal = bx_call('crm.deal.get', ['id' => $dealId]);
 
     $stage    = $deal['STAGE_ID'] ?? '';
@@ -109,25 +163,26 @@ try {
 
     log_msg("Conditions OK — CLEANUP start");
 
-    // --- 5. Останавливаем все активные БП ---
-    $docId = ['crm', 'CCrmDocumentDeal', 'DEAL_'.$dealId];
+    //----------------------------------------------------------------------
+    // 5. СНАЧАЛА ОСТАНАВЛИВАЕМ ВСЕ АКТИВНЫЕ БИЗНЕС-ПРОЦЕССЫ СДЕЛКИ
+    //----------------------------------------------------------------------
 
-    $instances = bx_call('bizproc.workflow.instances', [
-        'select' => ['ID','MODIFIED','STARTED','TEMPLATE_ID'],
-        'filter' => ['=DOCUMENT_ID' => $docId],
-    ]);
+    $workflows = findWorkflowsByDeal($dealId);
 
-    if (!empty($instances)) {
-        foreach ($instances as $wf) {
+    if (!empty($workflows)) {
+        foreach ($workflows as $wf) {
             $wfId = $wf['ID'];
-            log_msg("Terminate WF ID=$wfId");
+            log_msg("Terminate WF ID=$wfId (TEMPLATE_ID={$wf['TEMPLATE_ID']}, STARTED={$wf['STARTED']})");
             bx_call('bizproc.workflow.terminate', ['ID' => $wfId]);
         }
     } else {
-        log_msg("No active workflows");
+        log_msg("No active workflows for this deal");
     }
 
-    // --- 6. Закрываем задачи, привязанные к сделке ---
+    //----------------------------------------------------------------------
+    // 6. ПОСЛЕ ЭТОГО ЗАКРЫВАЕМ ВСЕ ЗАДАЧИ, ПРИВЯЗАННЫЕ К СДЕЛКЕ
+    //----------------------------------------------------------------------
+
     $binding = 'D_'.$dealId;
 
     $next = 0;
@@ -146,7 +201,7 @@ try {
 
         foreach ($tasks as $t) {
             $tId = $t['id'];
-            log_msg("Close TASK ID=$tId");
+            log_msg("Close TASK ID=$tId ({$t['title']})");
             bx_call('tasks.task.update', [
                 'taskId' => $tId,
                 'fields' => ['STATUS' => 5],
