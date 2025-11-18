@@ -256,4 +256,33 @@ try {
             try {
                 log_msg("Closing TASK ID=$tId ($title)");
                 bx_call('tasks.task.update', [
-                    'taskId'
+                    'taskId' => $tId,
+                    'fields' => ['STATUS' => 5],
+                ]);
+                $totalClosed++;
+            } catch (Exception $e) {
+                log_msg("ERROR closing task $tId: " . $e->getMessage());
+            }
+        }
+    } while ($next != -1);
+
+    log_msg("Tasks closed: $totalClosed");
+    log_msg("CLEANUP DONE");
+
+    http_response_code(200);
+    echo json_encode([
+        'success' => true,
+        'dealId'  => $dealId,
+        'workflowsTerminated' => count($workflows),
+        'tasksClosed' => $totalClosed,
+    ]);
+
+} catch (Throwable $e) {
+    log_msg("FATAL ERROR: " . $e->getMessage());
+    log_msg("Trace: " . $e->getTraceAsString());
+    http_response_code(500);
+    echo json_encode([
+        'success' => false,
+        'error'   => $e->getMessage(),
+    ]);
+}
