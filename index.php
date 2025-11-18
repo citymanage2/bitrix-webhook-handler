@@ -1,12 +1,16 @@
 <?php
 /**
  * Bitrix24 Webhook Handler (Render PHP, без curl)
- *  - При onCrmDealUpdate проверяет сделку:
- *      CATEGORY_ID == 2
- *      STAGE_ID in [C2:WON, C2:APOLOGY, C2:LOSE]
- *  - Если да:
- *      1) Находит и ОСТАНАВЛИВАЕТ все активные БП по сделке
- *      2) Потом закрывает все задачи UF_CRM_TASK = D_<ID>
+ * ------------------------------------------------
+ * Сценарий:
+ *  - Render принимает исходящий вебхук Bitrix24 (onCrmDealUpdate)
+ *  - По ID сделки получает её поля
+ *  - Если:
+ *        CATEGORY_ID == 2
+ *        STAGE_ID in [C2:WON, C2:APOLOGY, C2:LOSE]
+ *    то:
+ *        1) Находит и останавливает все активные БП по сделке
+ *        2) Закрывает все задачи, привязанные к сделке (UF_CRM_TASK = D_<ID>)
  */
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -74,48 +78,35 @@ function bx_call($method, $params = []) {
 }
 
 /**
- * Находит все активные БП по сделке и возвращает массив workflow'ов
+ * Находит все активные бизнес-процессы по сделке.
+ * DOCUMENT_ID у процессов: DEAL_<ID>
  */
 function findWorkflowsByDeal($dealId) {
-    $docIdStr = "crm|CCrmDocumentDeal|DEAL_{$dealId}";
-    log_msg("Looking for workflows with DOCUMENT_ID = $docIdStr");
+    $targetDocId = 'DEAL_' . (int)$dealId;
 
-    // 1) Пробуем напрямую по DOCUMENT_ID
+    log_msg("Looking for workflows for DOCUMENT_ID = $targetDocId");
+
+    // Берём все активные CRM-процессы по сделкам
     $instances = bx_call('bizproc.workflow.instances', [
-        'select' => ['ID', 'DOCUMENT_ID', 'MODIFIED', 'TEMPLATE_ID', 'STARTED'],
-        'filter' => ['=DOCUMENT_ID' => $docIdStr],
+        'select' => ['ID', 'MODULE_ID', 'ENTITY', 'DOCUMENT_ID', 'TEMPLATE_ID', 'STARTED'],
+        'filter' => [
+            '=MODULE_ID' => 'crm',
+            '=ENTITY'    => 'CCrmDocumentDeal',
+        ],
     ]);
+
+    log_msg('Raw workflows: ' . json_encode($instances, JSON_UNESCAPED_UNICODE));
 
     $result = [];
 
-    if (!empty($instances)) {
-        foreach ($instances as $wf) {
-            if (($wf['DOCUMENT_ID'] ?? '') === $docIdStr) {
-                $result[] = $wf;
-            }
+    foreach ($instances as $wf) {
+        $docId = $wf['DOCUMENT_ID'] ?? '';
+        if ($docId === $targetDocId) {
+            $result[] = $wf;
         }
     }
 
-    // 2) Подстраховка: если вдруг фильтр не сработал — берём все CRM-процессы и
-    //    вручную отфильтровываем по DOCUMENT_ID
-    if (empty($result)) {
-        log_msg("No workflows by =DOCUMENT_ID, fallback by MODULE_ID/ENTITY");
-        $instances2 = bx_call('bizproc.workflow.instances', [
-            'select' => ['ID', 'DOCUMENT_ID', 'MODIFIED', 'TEMPLATE_ID', 'STARTED'],
-            'filter' => [
-                '=MODULE_ID' => 'crm',
-                '=ENTITY'    => 'CCrmDocumentDeal',
-            ],
-        ]);
-
-        foreach ($instances2 as $wf) {
-            if (($wf['DOCUMENT_ID'] ?? '') === $docIdStr) {
-                $result[] = $wf;
-            }
-        }
-    }
-
-    log_msg("Found workflows count = " . count($result));
+    log_msg("Matched workflows count = " . count($result));
     return $result;
 }
 
@@ -125,12 +116,14 @@ function findWorkflowsByDeal($dealId) {
 ///////////////////////////////////////////////////////////////////////////////
 
 try {
+    // Читаем тело запроса от исходящего вебхука Bitrix24
     $raw = file_get_contents('php://input');
     log_msg("RAW: ".$raw);
 
     $payload = json_decode($raw, true);
     $dealId  = 0;
 
+    // Получаем ID сделки из разных возможных структур
     if (isset($payload['data']['FIELDS']['ID'])) {
         $dealId = (int)$payload['data']['FIELDS']['ID'];
     } elseif (isset($payload['data']['ID'])) {
@@ -155,6 +148,7 @@ try {
 
     global $TARGET_CATEGORY, $TARGET_STAGES;
 
+    // Проверяем, что сделка в нужной воронке и на нужной стадии
     if ($category !== $TARGET_CATEGORY || !in_array($stage, $TARGET_STAGES, true)) {
         log_msg("Not our category/stage — SKIP");
         http_response_code(204);
@@ -200,8 +194,9 @@ try {
         $next  = $res['next'] ?? -1;
 
         foreach ($tasks as $t) {
-            $tId = $t['id'];
-            log_msg("Close TASK ID=$tId ({$t['title']})");
+            $tId   = $t['id'];
+            $title = $t['title'] ?? '';
+            log_msg("Close TASK ID=$tId ($title)");
             bx_call('tasks.task.update', [
                 'taskId' => $tId,
                 'fields' => ['STATUS' => 5],
