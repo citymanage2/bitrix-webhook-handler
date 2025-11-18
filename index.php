@@ -1,32 +1,59 @@
 <?php
 /**
  * Bitrix24 Webhook Handler (Render PHP, без curl)
- * ------------------------------------------------
- * Сценарий:
- *  - Render принимает исходящий вебхук Bitrix24 (onCrmDealUpdate)
- *  - По ID сделки получает её поля
- *  - Если:
- *        CATEGORY_ID == 2
- *        STAGE_ID in [C2:WON, C2:APOLOGY, C2:LOSE]
- *    то:
- *        1) Находит и останавливает все активные БП по сделке
- *        2) Закрывает все задачи, привязанные к сделке (UF_CRM_TASK = D_<ID>)
+ * С встроенным просмотром логов через ?show_logs=secret_key_12345
  */
+
+///////////////////////////////////////////////////////////////////////////////
+// ПРОСМОТР ЛОГОВ (добавлено в начало для быстрого доступа)
+///////////////////////////////////////////////////////////////////////////////
+
+if (isset($_GET['show_logs']) && $_GET['show_logs'] === 'secret_key_12345') {
+    header('Content-Type: text/plain; charset=utf-8');
+    
+    $logFile = '/tmp/render-b24.log';
+    $altLog = __DIR__ . '/bitrix-webhook.log';
+    
+    echo "=== BITRIX24 WEBHOOK LOGS ===\n";
+    echo "Time: " . date('Y-m-d H:i:s') . "\n";
+    echo "Script: " . __FILE__ . "\n\n";
+    
+    if (file_exists($logFile)) {
+        echo "=== LOG FILE: $logFile ===\n\n";
+        echo file_get_contents($logFile);
+    } elseif (file_exists($altLog)) {
+        echo "=== ALTERNATIVE LOG: $altLog ===\n\n";
+        echo file_get_contents($altLog);
+    } else {
+        echo "❌ No log files found!\n\n";
+        echo "Checked locations:\n";
+        echo "  - $logFile\n";
+        echo "  - $altLog\n\n";
+        echo "Current directory: " . getcwd() . "\n";
+        echo "Directory contents:\n";
+        print_r(scandir(__DIR__));
+    }
+    exit;
+}
 
 ///////////////////////////////////////////////////////////////////////////////
 // 1. НАСТРОЙКА WEBHOOK API BITRIX24
 ///////////////////////////////////////////////////////////////////////////////
 
-$BX_INCOMING = 'https://b24-p60ult.bitrix24.ru/rest/42/2enlvyaqd1s0w238/';   // ← ЗАМЕНИТЬ!!!
+$BX_INCOMING = 'https://b24-p60ult.bitrix24.ru/rest/42/2enlvyaqd1s0w238/';
 
 // Целевая воронка и стадии
 $TARGET_CATEGORY = 2;
 $TARGET_STAGES   = ['C2:WON', 'C2:APOLOGY', 'C2:LOSE'];
 
-// Логирование
+// Логирование - пробуем оба варианта
 $ENABLE_LOG = true;
 $LOG_FILE   = '/tmp/render-b24.log';
 
+// Если /tmp недоступен, пишем рядом со скриптом
+if (!is_writable('/tmp')) {
+    $LOG_FILE = __DIR__ . '/bitrix-webhook.log';
+}
 
 ///////////////////////////////////////////////////////////////////////////////
 // 2. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
@@ -187,9 +214,15 @@ function terminateWorkflow($wfId, $wfData = []) {
 ///////////////////////////////////////////////////////////////////////////////
 
 try {
+    log_msg("==================== NEW REQUEST ====================");
+    log_msg("Script file: " . __FILE__);
+    log_msg("Log file: " . $LOG_FILE);
+    log_msg("Request method: " . ($_SERVER['REQUEST_METHOD'] ?? 'unknown'));
+    log_msg("Request URI: " . ($_SERVER['REQUEST_URI'] ?? 'unknown'));
+    
     // Читаем тело запроса от исходящего вебхука Bitrix24
     $raw = file_get_contents('php://input');
-    log_msg("==================== NEW REQUEST ====================");
+    log_msg("RAW payload length: " . strlen($raw));
     log_msg("RAW: ".$raw);
 
     $payload = json_decode($raw, true);
@@ -311,3 +344,12 @@ try {
         'error'   => $e->getMessage(),
     ]);
 }
+```
+
+Теперь:
+
+1. **Загрузите этот файл** на Render
+2. **Запустите вебхук** из Bitrix24 (переведите сделку в финальную стадию)
+3. **Откройте в браузере**:
+```
+   https://ваш-домен.onrender.com/?show_logs=secret_key_12345
