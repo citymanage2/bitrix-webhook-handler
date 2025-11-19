@@ -27,11 +27,13 @@ if (isset($_GET['show_logs']) && $_GET['show_logs'] === 'secret_key_12345') {
 // НАСТРОЙКА
 ///////////////////////////////////////////////////////////////////////////////
 
-$BX_INCOMING = 'https://b24-p60ult.bitrix24.ru/rest/42/2enlvyaqd1s0w238/';
 $TARGET_CATEGORY = 2;
 $TARGET_STAGES   = ['C2:WON', 'C2:APOLOGY', 'C2:LOSE'];
 $ENABLE_LOG = true;
 $LOG_FILE   = '/tmp/render-b24.log';
+
+// Глобальная переменная для токена
+$AUTH_TOKEN = '';
 
 ///////////////////////////////////////////////////////////////////////////////
 // ФУНКЦИИ
@@ -44,9 +46,15 @@ function log_msg($msg) {
 }
 
 function bx_call($method, $params = []) {
-    global $BX_INCOMING;
+    global $AUTH_TOKEN;
 
-    $url  = $BX_INCOMING . $method . '.json';
+    if (empty($AUTH_TOKEN)) {
+        throw new RuntimeException("AUTH_TOKEN not set");
+    }
+
+    // Используем токен из webhook
+    $url = $AUTH_TOKEN['client_endpoint'] . $method . '.json';
+    
     $data = http_build_query($params);
 
     $opts = [
@@ -107,8 +115,6 @@ function findWorkflowsByDeal($dealId) {
                 $docIdStr = $docId;
             }
             
-            log_msg("Checking WF ID={$wf['ID']}, DOCUMENT_ID=$docIdStr");
-            
             if ($docIdStr === $targetDocId) {
                 $result[] = $wf;
                 log_msg("✓ MATCHED WF ID={$wf['ID']}");
@@ -127,9 +133,7 @@ function findWorkflowsByDeal($dealId) {
 function terminateWorkflow($wfId, $wfData = []) {
     log_msg("=== TERMINATING WORKFLOW ID=$wfId ===");
     
-    // Метод 1: bizproc.workflow.terminate
     try {
-        log_msg("Trying bizproc.workflow.terminate...");
         $result = bx_call('bizproc.workflow.terminate', [
             'ID' => $wfId,
             'STATUS' => 'Stopped by automation'
@@ -138,22 +142,8 @@ function terminateWorkflow($wfId, $wfData = []) {
         return true;
     } catch (Exception $e) {
         log_msg("FAILED terminate: " . $e->getMessage());
+        return false;
     }
-
-    // Метод 2: bizproc.workflow.kill
-    try {
-        log_msg("Trying bizproc.workflow.kill...");
-        $result = bx_call('bizproc.workflow.kill', [
-            'ID' => $wfId
-        ]);
-        log_msg("SUCCESS: kill result = " . json_encode($result));
-        return true;
-    } catch (Exception $e) {
-        log_msg("FAILED kill: " . $e->getMessage());
-    }
-
-    log_msg("ERROR: All methods failed for WF ID=$wfId");
-    return false;
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -163,11 +153,9 @@ function terminateWorkflow($wfId, $wfData = []) {
 try {
     log_msg("==================== NEW REQUEST ====================");
     log_msg("Method: " . ($_SERVER['REQUEST_METHOD'] ?? 'unknown'));
-    log_msg("URI: " . ($_SERVER['REQUEST_URI'] ?? 'unknown'));
     
     $raw = file_get_contents('php://input');
     log_msg("Payload length: " . strlen($raw));
-    log_msg("Payload: " . $raw);
 
     if (strlen($raw) == 0) {
         log_msg("Empty payload - health check");
@@ -176,17 +164,21 @@ try {
         exit;
     }
 
-    // КРИТИЧНО: Bitrix24 отправляет данные как application/x-www-form-urlencoded
     parse_str($raw, $payload);
     log_msg("Parsed payload: " . json_encode($payload, JSON_UNESCAPED_UNICODE));
 
+    // Сохраняем токен авторизации
+    if (isset($payload['auth'])) {
+        $AUTH_TOKEN = $payload['auth'];
+        log_msg("Auth token received from domain: " . ($AUTH_TOKEN['domain'] ?? 'unknown'));
+    } else {
+        log_msg("WARNING: No auth token in payload");
+    }
+
     $dealId = 0;
 
-    // Получаем ID сделки
     if (isset($payload['data']['FIELDS']['ID'])) {
         $dealId = (int)$payload['data']['FIELDS']['ID'];
-    } elseif (isset($_POST['data']['FIELDS']['ID'])) {
-        $dealId = (int)$_POST['data']['FIELDS']['ID'];
     }
 
     log_msg("Extracted Deal ID: $dealId");
@@ -215,27 +207,29 @@ try {
     log_msg("Conditions OK - START CLEANUP");
 
     //----------------------------------------------------------------------
-    // ОСТАНАВЛИВАЕМ БИЗНЕС-ПРОЦЕССЫ
+    // 1. СНАЧАЛА ОСТАНАВЛИВАЕМ БИЗНЕС-ПРОЦЕССЫ
     //----------------------------------------------------------------------
 
     $workflows = findWorkflowsByDeal($dealId);
+    $workflowsCount = 0;
 
     if (!empty($workflows)) {
         log_msg("Found " . count($workflows) . " workflows to terminate");
         foreach ($workflows as $wf) {
-            $success = terminateWorkflow($wf['ID'], $wf);
-            if ($success) {
+            if (terminateWorkflow($wf['ID'], $wf)) {
+                $workflowsCount++;
                 log_msg("✓ Successfully terminated WF ID={$wf['ID']}");
             } else {
                 log_msg("✗ Failed to terminate WF ID={$wf['ID']}");
             }
         }
+        log_msg("Terminated $workflowsCount workflows");
     } else {
         log_msg("No active workflows found");
     }
 
     //----------------------------------------------------------------------
-    // ЗАКРЫВАЕМ ЗАДАЧИ
+    // 2. ПОТОМ ЗАКРЫВАЕМ ЗАДАЧИ
     //----------------------------------------------------------------------
 
     $binding = 'D_'.$dealId;
@@ -244,43 +238,49 @@ try {
     $next = 0;
     $totalClosed = 0;
     
-    do {
-        $res = bx_call('tasks.task.list', [
-            'select' => ['ID','TITLE','STATUS','UF_CRM_TASK'],
-            'filter' => [
-                '=UF_CRM_TASK' => $binding,
-                '!=STATUS'     => 5,
-            ],
-            'start' => $next,
-        ]);
+    try {
+        do {
+            $res = bx_call('tasks.task.list', [
+                'select' => ['ID','TITLE','STATUS','UF_CRM_TASK'],
+                'filter' => [
+                    '=UF_CRM_TASK' => $binding,
+                    '!=STATUS'     => 5,
+                ],
+                'start' => $next,
+            ]);
 
-        $tasks = $res['tasks'] ?? [];
-        $next  = $res['next'] ?? -1;
+            $tasks = $res['tasks'] ?? [];
+            $next  = $res['next'] ?? -1;
 
-        foreach ($tasks as $t) {
-            $tId   = $t['id'];
-            $title = $t['title'] ?? '';
-            try {
-                log_msg("Closing TASK ID=$tId ($title)");
-                bx_call('tasks.task.update', [
-                    'taskId' => $tId,
-                    'fields' => ['STATUS' => 5],
-                ]);
-                $totalClosed++;
-            } catch (Exception $e) {
-                log_msg("ERROR closing task $tId: " . $e->getMessage());
+            foreach ($tasks as $t) {
+                $tId   = $t['id'];
+                $title = $t['title'] ?? '';
+                try {
+                    log_msg("Closing TASK ID=$tId ($title)");
+                    bx_call('tasks.task.update', [
+                        'taskId' => $tId,
+                        'fields' => ['STATUS' => 5],
+                    ]);
+                    $totalClosed++;
+                } catch (Exception $e) {
+                    log_msg("ERROR closing task $tId: " . $e->getMessage());
+                }
             }
-        }
-    } while ($next != -1);
+        } while ($next != -1);
 
-    log_msg("Tasks closed: $totalClosed");
-    log_msg("CLEANUP DONE");
+        log_msg("Tasks closed: $totalClosed");
+    } catch (Exception $e) {
+        log_msg("ERROR getting tasks: " . $e->getMessage());
+        log_msg("This might be a permissions issue with the webhook");
+    }
+
+    log_msg("CLEANUP DONE - Workflows: $workflowsCount, Tasks: $totalClosed");
 
     http_response_code(200);
     echo json_encode([
         'success' => true,
         'dealId'  => $dealId,
-        'workflowsTerminated' => count($workflows),
+        'workflowsTerminated' => $workflowsCount,
         'tasksClosed' => $totalClosed,
     ]);
 
