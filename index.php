@@ -1,7 +1,6 @@
 <?php
-// Включаем показ ошибок для отладки
 error_reporting(E_ALL);
-ini_set('display_errors', 0); // Отключаем вывод на экран, пишем только в лог
+ini_set('display_errors', 0);
 ini_set('log_errors', 1);
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -108,6 +107,8 @@ function findWorkflowsByDeal($dealId) {
                 $docIdStr = $docId;
             }
             
+            log_msg("Checking WF ID={$wf['ID']}, DOCUMENT_ID=$docIdStr");
+            
             if ($docIdStr === $targetDocId) {
                 $result[] = $wf;
                 log_msg("✓ MATCHED WF ID={$wf['ID']}");
@@ -169,20 +170,26 @@ try {
     log_msg("Payload: " . $raw);
 
     if (strlen($raw) == 0) {
-        log_msg("Empty payload - probably health check or browser request");
+        log_msg("Empty payload - health check");
         http_response_code(200);
         echo "Webhook handler is ready";
         exit;
     }
 
-    $payload = json_decode($raw, true);
-    $dealId  = 0;
+    // КРИТИЧНО: Bitrix24 отправляет данные как application/x-www-form-urlencoded
+    parse_str($raw, $payload);
+    log_msg("Parsed payload: " . json_encode($payload, JSON_UNESCAPED_UNICODE));
 
+    $dealId = 0;
+
+    // Получаем ID сделки
     if (isset($payload['data']['FIELDS']['ID'])) {
         $dealId = (int)$payload['data']['FIELDS']['ID'];
-    } elseif (isset($payload['data']['ID'])) {
-        $dealId = (int)$payload['data']['ID'];
+    } elseif (isset($_POST['data']['FIELDS']['ID'])) {
+        $dealId = (int)$_POST['data']['FIELDS']['ID'];
     }
+
+    log_msg("Extracted Deal ID: $dealId");
 
     if ($dealId <= 0) {
         log_msg("NO DEAL ID in payload - EXIT");
