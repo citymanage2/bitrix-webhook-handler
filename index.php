@@ -1,7 +1,7 @@
 <?php
 /**
  * Bitrix24 Webhook Handler для Render
- * Останавливает БП и закрывает задачи при закрытии сделки
+ * Останавливает только БП при закрытии сделки (без закрытия задач)
  */
 
 error_reporting(E_ALL);
@@ -36,14 +36,15 @@ $BX_INCOMING = 'https://b24-p60ult.bitrix24.ru/rest/42/2enlvyaqd1s0w238/';
 
 // Целевая воронка и стадии
 $TARGET_CATEGORY = 2;
-$TARGET_STAGES   = ['C2:WON', 'C2:APOLOGY', 'C2:LOSE'];
+$TARGET_STAGES   = [
+    'C2:WON',           // Успешно реализовано
+    'C2:APOLOGY',       // Извинились
+    'C2:LOSE',          // Проиграли
+];
 
 // Логирование
 $ENABLE_LOG = true;
 $LOG_FILE   = '/tmp/render-b24.log';
-
-// Пауза между остановкой БП и закрытием задач (в секундах)
-$PAUSE_SECONDS = 10;
 
 ///////////////////////////////////////////////////////////////////////////////
 // ФУНКЦИИ
@@ -200,14 +201,12 @@ try {
         exit;
     }
 
-    log_msg("Conditions OK - START CLEANUP");
+    log_msg("Conditions OK - TERMINATE ALL WORKFLOWS");
 
     //----------------------------------------------------------------------
-    // ЭТАП 1: ОСТАНАВЛИВАЕМ БИЗНЕС-ПРОЦЕССЫ
+    // ОСТАНАВЛИВАЕМ ВСЕ БИЗНЕС-ПРОЦЕССЫ (БЕЗ ЗАКРЫТИЯ ЗАДАЧ!)
     //----------------------------------------------------------------------
 
-    log_msg("=== STEP 1: TERMINATE WORKFLOWS ===");
-    
     $workflows = findWorkflowsByDeal($dealId);
     $workflowsCount = 0;
 
@@ -226,75 +225,16 @@ try {
         log_msg("No active workflows found");
     }
 
-    //----------------------------------------------------------------------
-    // ПАУЗА 10 СЕКУНД
-    //----------------------------------------------------------------------
-
-    global $PAUSE_SECONDS;
-    log_msg("=== PAUSE FOR $PAUSE_SECONDS SECONDS ===");
-    log_msg("Waiting for workflows to fully terminate...");
-    sleep($PAUSE_SECONDS);
-    log_msg("Pause completed");
-
-    //----------------------------------------------------------------------
-    // ЭТАП 2: ЗАКРЫВАЕМ ЗАДАЧИ
-    //----------------------------------------------------------------------
-
-    log_msg("=== STEP 2: CLOSE TASKS ===");
-    
-    $binding = 'D_'.$dealId;
-    log_msg("Looking for tasks with binding: $binding");
-
-    $next = 0;
-    $totalClosed = 0;
-    
-    try {
-        do {
-            $res = bx_call('tasks.task.list', [
-                'select' => ['ID','TITLE','STATUS','UF_CRM_TASK'],
-                'filter' => [
-                    '=UF_CRM_TASK' => $binding,
-                    '!=STATUS'     => 5,
-                ],
-                'start' => $next,
-            ]);
-
-            $tasks = $res['tasks'] ?? [];
-            $next  = $res['next'] ?? -1;
-
-            log_msg("Found " . count($tasks) . " open tasks in this batch");
-
-            foreach ($tasks as $t) {
-                $tId   = $t['id'];
-                $title = $t['title'] ?? '';
-                try {
-                    log_msg("Closing TASK ID=$tId ($title)");
-                    bx_call('tasks.task.update', [
-                        'taskId' => $tId,
-                        'fields' => ['STATUS' => 5],
-                    ]);
-                    $totalClosed++;
-                    log_msg("✓ Task $tId closed successfully");
-                } catch (Exception $e) {
-                    log_msg("✗ ERROR closing task $tId: " . $e->getMessage());
-                }
-            }
-        } while ($next != -1);
-
-        log_msg("Total tasks closed: $totalClosed");
-    } catch (Exception $e) {
-        log_msg("ERROR getting tasks: " . $e->getMessage());
-    }
-
     log_msg("==================== CLEANUP COMPLETED ====================");
-    log_msg("Summary: Workflows terminated=$workflowsCount, Tasks closed=$totalClosed");
+    log_msg("Summary: Workflows terminated=$workflowsCount");
+    log_msg("NOTE: Tasks are NOT closed to prevent stage changes");
 
     http_response_code(200);
     echo json_encode([
         'success' => true,
         'dealId'  => $dealId,
         'workflowsTerminated' => $workflowsCount,
-        'tasksClosed' => $totalClosed,
+        'note' => 'Tasks were not closed to prevent automatic stage changes'
     ]);
 
 } catch (Throwable $e) {
