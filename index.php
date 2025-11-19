@@ -42,6 +42,9 @@ $TARGET_STAGES   = ['C2:WON', 'C2:APOLOGY', 'C2:LOSE'];
 $ENABLE_LOG = true;
 $LOG_FILE   = '/tmp/render-b24.log';
 
+// Пауза между остановкой БП и закрытием задач (в секундах)
+$PAUSE_SECONDS = 10;
+
 ///////////////////////////////////////////////////////////////////////////////
 // ФУНКЦИИ
 ///////////////////////////////////////////////////////////////////////////////
@@ -200,9 +203,11 @@ try {
     log_msg("Conditions OK - START CLEANUP");
 
     //----------------------------------------------------------------------
-    // 1. СНАЧАЛА ОСТАНАВЛИВАЕМ БИЗНЕС-ПРОЦЕССЫ
+    // ЭТАП 1: ОСТАНАВЛИВАЕМ БИЗНЕС-ПРОЦЕССЫ
     //----------------------------------------------------------------------
 
+    log_msg("=== STEP 1: TERMINATE WORKFLOWS ===");
+    
     $workflows = findWorkflowsByDeal($dealId);
     $workflowsCount = 0;
 
@@ -222,11 +227,23 @@ try {
     }
 
     //----------------------------------------------------------------------
-    // 2. ПОТОМ ЗАКРЫВАЕМ ЗАДАЧИ
+    // ПАУЗА 10 СЕКУНД
     //----------------------------------------------------------------------
 
+    global $PAUSE_SECONDS;
+    log_msg("=== PAUSE FOR $PAUSE_SECONDS SECONDS ===");
+    log_msg("Waiting for workflows to fully terminate...");
+    sleep($PAUSE_SECONDS);
+    log_msg("Pause completed");
+
+    //----------------------------------------------------------------------
+    // ЭТАП 2: ЗАКРЫВАЕМ ЗАДАЧИ
+    //----------------------------------------------------------------------
+
+    log_msg("=== STEP 2: CLOSE TASKS ===");
+    
     $binding = 'D_'.$dealId;
-    log_msg("=== CLOSING TASKS: $binding ===");
+    log_msg("Looking for tasks with binding: $binding");
 
     $next = 0;
     $totalClosed = 0;
@@ -245,6 +262,8 @@ try {
             $tasks = $res['tasks'] ?? [];
             $next  = $res['next'] ?? -1;
 
+            log_msg("Found " . count($tasks) . " open tasks in this batch");
+
             foreach ($tasks as $t) {
                 $tId   = $t['id'];
                 $title = $t['title'] ?? '';
@@ -255,18 +274,20 @@ try {
                         'fields' => ['STATUS' => 5],
                     ]);
                     $totalClosed++;
+                    log_msg("✓ Task $tId closed successfully");
                 } catch (Exception $e) {
-                    log_msg("ERROR closing task $tId: " . $e->getMessage());
+                    log_msg("✗ ERROR closing task $tId: " . $e->getMessage());
                 }
             }
         } while ($next != -1);
 
-        log_msg("Tasks closed: $totalClosed");
+        log_msg("Total tasks closed: $totalClosed");
     } catch (Exception $e) {
         log_msg("ERROR getting tasks: " . $e->getMessage());
     }
 
-    log_msg("CLEANUP DONE - Workflows: $workflowsCount, Tasks: $totalClosed");
+    log_msg("==================== CLEANUP COMPLETED ====================");
+    log_msg("Summary: Workflows terminated=$workflowsCount, Tasks closed=$totalClosed");
 
     http_response_code(200);
     echo json_encode([
@@ -277,7 +298,8 @@ try {
     ]);
 
 } catch (Throwable $e) {
-    log_msg("FATAL ERROR: " . $e->getMessage());
+    log_msg("==================== FATAL ERROR ====================");
+    log_msg("ERROR: " . $e->getMessage());
     log_msg("Trace: " . $e->getTraceAsString());
     http_response_code(500);
     echo json_encode([
