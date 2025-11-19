@@ -1,7 +1,7 @@
 <?php
 /**
  * Bitrix24 Webhook Handler для Render
- * Останавливает только БП при закрытии сделки (без закрытия задач)
+ * Останавливает ТОЛЬКО бизнес-процессы при закрытии сделки
  */
 
 error_reporting(E_ALL);
@@ -135,18 +135,18 @@ function findWorkflowsByDeal($dealId) {
     }
 }
 
-function terminateWorkflow($wfId, $wfData = []) {
-    log_msg("=== TERMINATING WORKFLOW ID=$wfId ===");
+function terminateWorkflow($wfId) {
+    log_msg("Terminating WF ID=$wfId");
     
     try {
         $result = bx_call('bizproc.workflow.terminate', [
             'ID' => $wfId,
             'STATUS' => 'Stopped by automation'
         ]);
-        log_msg("SUCCESS: terminate result = " . json_encode($result));
+        log_msg("✓ Terminated WF ID=$wfId");
         return true;
     } catch (Exception $e) {
-        log_msg("FAILED terminate: " . $e->getMessage());
+        log_msg("✗ Failed to terminate WF ID=$wfId: " . $e->getMessage());
         return false;
     }
 }
@@ -157,31 +157,21 @@ function terminateWorkflow($wfId, $wfData = []) {
 
 try {
     log_msg("==================== NEW REQUEST ====================");
-    log_msg("Method: " . ($_SERVER['REQUEST_METHOD'] ?? 'unknown'));
     
     $raw = file_get_contents('php://input');
-    log_msg("Payload length: " . strlen($raw));
 
     if (strlen($raw) == 0) {
-        log_msg("Empty payload - health check");
         http_response_code(200);
         echo "Webhook handler is ready";
         exit;
     }
 
-    // Bitrix24 отправляет данные как application/x-www-form-urlencoded
     parse_str($raw, $payload);
 
-    $dealId = 0;
-
-    if (isset($payload['data']['FIELDS']['ID'])) {
-        $dealId = (int)$payload['data']['FIELDS']['ID'];
-    }
-
-    log_msg("Extracted Deal ID: $dealId");
+    $dealId = (int)($payload['data']['FIELDS']['ID'] ?? 0);
 
     if ($dealId <= 0) {
-        log_msg("NO DEAL ID in payload - EXIT");
+        log_msg("NO DEAL ID - EXIT");
         http_response_code(204);
         exit;
     }
@@ -196,51 +186,34 @@ try {
     log_msg("Deal: STAGE=$stage, CATEGORY=$category");
 
     if ($category !== $TARGET_CATEGORY || !in_array($stage, $TARGET_STAGES, true)) {
-        log_msg("Not target category/stage - SKIP");
+        log_msg("Not target stage - SKIP");
         http_response_code(204);
         exit;
     }
 
-    log_msg("Conditions OK - TERMINATE ALL WORKFLOWS");
+    log_msg("Target stage reached - TERMINATE WORKFLOWS");
 
-    //----------------------------------------------------------------------
-    // ОСТАНАВЛИВАЕМ ВСЕ БИЗНЕС-ПРОЦЕССЫ (БЕЗ ЗАКРЫТИЯ ЗАДАЧ!)
-    //----------------------------------------------------------------------
-
+    // Останавливаем все БП
     $workflows = findWorkflowsByDeal($dealId);
-    $workflowsCount = 0;
+    $terminated = 0;
 
-    if (!empty($workflows)) {
-        log_msg("Found " . count($workflows) . " workflows to terminate");
-        foreach ($workflows as $wf) {
-            if (terminateWorkflow($wf['ID'], $wf)) {
-                $workflowsCount++;
-                log_msg("✓ Successfully terminated WF ID={$wf['ID']}");
-            } else {
-                log_msg("✗ Failed to terminate WF ID={$wf['ID']}");
-            }
+    foreach ($workflows as $wf) {
+        if (terminateWorkflow($wf['ID'])) {
+            $terminated++;
         }
-        log_msg("Terminated $workflowsCount workflows");
-    } else {
-        log_msg("No active workflows found");
     }
 
-    log_msg("==================== CLEANUP COMPLETED ====================");
-    log_msg("Summary: Workflows terminated=$workflowsCount");
-    log_msg("NOTE: Tasks are NOT closed to prevent stage changes");
+    log_msg("DONE: Terminated $terminated workflows");
 
     http_response_code(200);
     echo json_encode([
         'success' => true,
         'dealId'  => $dealId,
-        'workflowsTerminated' => $workflowsCount,
-        'note' => 'Tasks were not closed to prevent automatic stage changes'
+        'workflowsTerminated' => $terminated,
     ]);
 
 } catch (Throwable $e) {
-    log_msg("==================== FATAL ERROR ====================");
     log_msg("ERROR: " . $e->getMessage());
-    log_msg("Trace: " . $e->getTraceAsString());
     http_response_code(500);
     echo json_encode([
         'success' => false,
