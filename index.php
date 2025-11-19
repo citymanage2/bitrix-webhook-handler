@@ -1,4 +1,9 @@
 <?php
+/**
+ * Bitrix24 Webhook Handler для Render
+ * Останавливает БП и закрывает задачи при закрытии сделки
+ */
+
 error_reporting(E_ALL);
 ini_set('display_errors', 0);
 ini_set('log_errors', 1);
@@ -27,13 +32,15 @@ if (isset($_GET['show_logs']) && $_GET['show_logs'] === 'secret_key_12345') {
 // НАСТРОЙКА
 ///////////////////////////////////////////////////////////////////////////////
 
+$BX_INCOMING = 'https://b24-p60ult.bitrix24.ru/rest/42/2enlvyaqd1s0w238/';
+
+// Целевая воронка и стадии
 $TARGET_CATEGORY = 2;
 $TARGET_STAGES   = ['C2:WON', 'C2:APOLOGY', 'C2:LOSE'];
+
+// Логирование
 $ENABLE_LOG = true;
 $LOG_FILE   = '/tmp/render-b24.log';
-
-// Глобальная переменная для токена
-$AUTH_TOKEN = '';
 
 ///////////////////////////////////////////////////////////////////////////////
 // ФУНКЦИИ
@@ -46,15 +53,9 @@ function log_msg($msg) {
 }
 
 function bx_call($method, $params = []) {
-    global $AUTH_TOKEN;
+    global $BX_INCOMING;
 
-    if (empty($AUTH_TOKEN)) {
-        throw new RuntimeException("AUTH_TOKEN not set");
-    }
-
-    // Используем токен из webhook
-    $url = $AUTH_TOKEN['client_endpoint'] . $method . '.json';
-    
+    $url  = $BX_INCOMING . $method . '.json';
     $data = http_build_query($params);
 
     $opts = [
@@ -164,16 +165,8 @@ try {
         exit;
     }
 
+    // Bitrix24 отправляет данные как application/x-www-form-urlencoded
     parse_str($raw, $payload);
-    log_msg("Parsed payload: " . json_encode($payload, JSON_UNESCAPED_UNICODE));
-
-    // Сохраняем токен авторизации
-    if (isset($payload['auth'])) {
-        $AUTH_TOKEN = $payload['auth'];
-        log_msg("Auth token received from domain: " . ($AUTH_TOKEN['domain'] ?? 'unknown'));
-    } else {
-        log_msg("WARNING: No auth token in payload");
-    }
 
     $dealId = 0;
 
@@ -271,7 +264,6 @@ try {
         log_msg("Tasks closed: $totalClosed");
     } catch (Exception $e) {
         log_msg("ERROR getting tasks: " . $e->getMessage());
-        log_msg("This might be a permissions issue with the webhook");
     }
 
     log_msg("CLEANUP DONE - Workflows: $workflowsCount, Tasks: $totalClosed");
