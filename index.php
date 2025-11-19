@@ -136,19 +136,60 @@ function findWorkflowsByDeal($dealId) {
 }
 
 function terminateWorkflow($wfId) {
-    log_msg("Terminating WF ID=$wfId");
+    log_msg("=== TERMINATING WF ID=$wfId ===");
     
+    // Метод 1: bizproc.workflow.terminate БЕЗ параметра STATUS
     try {
+        log_msg("Method 1: bizproc.workflow.terminate (no status)");
         $result = bx_call('bizproc.workflow.terminate', [
-            'ID' => $wfId,
-            'STATUS' => 'Stopped by automation'
+            'ID' => $wfId
         ]);
-        log_msg("✓ Terminated WF ID=$wfId");
+        log_msg("✓ SUCCESS Method 1: " . json_encode($result));
         return true;
     } catch (Exception $e) {
-        log_msg("✗ Failed to terminate WF ID=$wfId: " . $e->getMessage());
-        return false;
+        log_msg("✗ FAILED Method 1: " . $e->getMessage());
     }
+
+    // Метод 2: bizproc.workflow.kill
+    try {
+        log_msg("Method 2: bizproc.workflow.kill");
+        $result = bx_call('bizproc.workflow.kill', [
+            'ID' => $wfId
+        ]);
+        log_msg("✓ SUCCESS Method 2: " . json_encode($result));
+        return true;
+    } catch (Exception $e) {
+        log_msg("✗ FAILED Method 2: " . $e->getMessage());
+    }
+
+    // Метод 3: bizproc.workflow.terminate со статусом "Terminated"
+    try {
+        log_msg("Method 3: bizproc.workflow.terminate with Terminated status");
+        $result = bx_call('bizproc.workflow.terminate', [
+            'ID' => $wfId,
+            'STATUS' => 'Terminated'
+        ]);
+        log_msg("✓ SUCCESS Method 3: " . json_encode($result));
+        return true;
+    } catch (Exception $e) {
+        log_msg("✗ FAILED Method 3: " . $e->getMessage());
+    }
+
+    // Метод 4: bizproc.workflow.terminate со статусом 0 (остановлен)
+    try {
+        log_msg("Method 4: bizproc.workflow.terminate with status=0");
+        $result = bx_call('bizproc.workflow.terminate', [
+            'ID' => $wfId,
+            'STATUS' => 0
+        ]);
+        log_msg("✓ SUCCESS Method 4: " . json_encode($result));
+        return true;
+    } catch (Exception $e) {
+        log_msg("✗ FAILED Method 4: " . $e->getMessage());
+    }
+
+    log_msg("✗✗✗ ALL METHODS FAILED FOR WF ID=$wfId");
+    return false;
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -203,16 +244,19 @@ try {
         }
     }
 
-    log_msg("DONE: Terminated $terminated workflows");
+    log_msg("==================== DONE ====================");
+    log_msg("Terminated $terminated of " . count($workflows) . " workflows");
 
     http_response_code(200);
     echo json_encode([
         'success' => true,
         'dealId'  => $dealId,
+        'workflowsFound' => count($workflows),
         'workflowsTerminated' => $terminated,
     ]);
 
 } catch (Throwable $e) {
+    log_msg("==================== ERROR ====================");
     log_msg("ERROR: " . $e->getMessage());
     http_response_code(500);
     echo json_encode([
